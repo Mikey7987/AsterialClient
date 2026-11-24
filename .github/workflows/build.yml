@@ -984,6 +984,9 @@ jobs:
       - name: Build Fabric Mod Jar
         run: gradle build --no-daemon
 
+      - name: List Built Jars
+        run: find build -name "*.jar" -type f
+
       - name: Upload Compiled Jar
         uses: actions/upload-artifact@v4
         with:
