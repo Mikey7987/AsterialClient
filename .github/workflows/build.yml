@@ -13,7 +13,7 @@ jobs:
 
     steps:
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           java-version: '21'
           distribution: 'temurin'
@@ -321,4 +321,140 @@ jobs:
               private final double max;
               private final double step;
 
-              public NumberSetting(String name, double defaultValue, double min, double max, double step)
+              public NumberSetting(String name, double defaultValue, double min, double max, double step) {
+                  super(name, defaultValue);
+                  this.min = min;
+                  this.max = max;
+                  this.step = step;
+              }
+
+              public double getMin() {
+                  return min;
+              }
+
+              public double getMax() {
+                  return max;
+              }
+
+              public double getStep() {
+                  return step;
+              }
+
+              @Override
+              public void setValue(Double newVal) {
+                  double clamped = Math.max(min, Math.min(max, newVal));
+                  double snapped = Math.round(clamped / step) * step;
+                  this.value = Math.max(min, Math.min(max, Math.round(snapped * 1000.0) / 1000.0));
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/velour/client/module/ModuleManager.java
+          package com.velour.client.module;
+
+          import com.velour.client.module.impl.AimAssistModule;
+          import com.velour.client.module.impl.AutoJumpResetModule;
+          import com.velour.client.module.impl.AutoShieldBreakerModule;
+          import com.velour.client.module.impl.TriggerBotModule;
+          import net.minecraft.client.MinecraftClient;
+
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.List;
+
+          public class ModuleManager {
+              private final List<Module> modules = new ArrayList<>();
+
+              public ModuleManager() {
+                  modules.add(new AimAssistModule());
+                  modules.add(new TriggerBotModule());
+                  modules.add(new AutoShieldBreakerModule());
+                  modules.add(new AutoJumpResetModule());
+              }
+
+              public List<Module> getModules() {
+                  return Collections.unmodifiableList(modules);
+              }
+
+              public List<Module> getByCategory(Category category) {
+                  List<Module> out = new ArrayList<>();
+                  for (Module m : modules) {
+                      if (m.getCategory() == category) out.add(m);
+                  }
+                  return out;
+              }
+
+              public void onTick(MinecraftClient client) {
+                  for (Module module : modules) {
+                      if (module.isEnabled()) {
+                          module.onTick(client);
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/velour/client/module/impl/AimAssistModule.java
+          package com.velour.client.module.impl;
+
+          import com.velour.client.module.Category;
+          import com.velour.client.module.Module;
+          import com.velour.client.module.setting.BooleanSetting;
+          import com.velour.client.module.setting.NumberSetting;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.entity.LivingEntity;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.util.math.MathHelper;
+          import net.minecraft.util.math.Vec3d;
+
+          import java.util.Comparator;
+          import java.util.concurrent.ThreadLocalRandom;
+
+          public class AimAssistModule extends Module {
+              private final NumberSetting range = addSetting(new NumberSetting("Range", 3.6, 2.5, 6.0, 0.1));
+              private final NumberSetting fov = addSetting(new NumberSetting("FOV", 75.0, 15.0, 180.0, 5.0));
+              private final NumberSetting horizontalSpeed = addSetting(new NumberSetting("H-Speed", 18.0, 2.0, 80.0, 1.0));
+              private final NumberSetting verticalSpeed = addSetting(new NumberSetting("V-Speed", 8.0, 0.0, 60.0, 1.0));
+              private final NumberSetting jitter = addSetting(new NumberSetting("Jitter", 0.35, 0.0, 2.0, 0.05));
+              private final BooleanSetting onlyOnAttack = addSetting(new BooleanSetting("Only On Attack", true));
+              private final BooleanSetting verticalAim = addSetting(new BooleanSetting("Vertical Aim", true));
+              private final BooleanSetting playersOnly = addSetting(new BooleanSetting("Players Only", true));
+
+              public AimAssistModule() {
+                  super("AimAssist", "Smooth yaw/pitch assist with FOV & jitter.", Category.COMBAT);
+              }
+
+              @Override
+              public void onTick(MinecraftClient client) {
+                  if (client.player == null || client.world == null) return;
+                  if (onlyOnAttack.getValue() && !client.options.attackKey.isPressed()) return;
+
+                  PlayerEntity self = client.player;
+                  LivingEntity target = client.world.getEntitiesByClass(
+                                  LivingEntity.class,
+                                  self.getBoundingBox().expand(range.getValue()),
+                                  entity -> isValidTarget(self, entity)
+                          ).stream()
+                          .min(Comparator.comparingDouble(e -> angleDelta(self, e)))
+                          .orElse(null);
+
+                  if (target == null) return;
+
+                  Vec3d eyePos = self.getEyePos();
+                  Vec3d aimPoint = target.getBoundingBox().getCenter();
+                  if (verticalAim.getValue()) {
+                      aimPoint = new Vec3d(aimPoint.x, target.getY() + target.getHeight() * 0.65, aimPoint.z);
+                  } else {
+                      aimPoint = new Vec3d(aimPoint.x, eyePos.y, aimPoint.z);
+                  }
+
+                  double dx = aimPoint.x - eyePos.x;
+                  double dy = aimPoint.y - eyePos.y;
+                  double dz = aimPoint.z - eyePos.z;
+                  double horizDist = Math.sqrt(dx * dx + dz * dz);
+
+                  float targetYaw = (float) (MathHelper.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0f;
+                  float targetPitch = (float) (-(MathHelper.atan2(dy, horizDist) * (180.0 / Math.PI)));
+
+                  float yawDiff = MathHelper.wrapDegrees(targetYaw - self.getYaw());
+                  float pitchDiff = MathHelper.wrapDegrees(targetPitch -
