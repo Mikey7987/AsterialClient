@@ -414,33 +414,29 @@ jobs:
           import java.util.concurrent.ThreadLocalRandom;
 
           public class AimAssistModule extends Module {
-              private final NumberSetting range = addSetting(new NumberSetting("Range", 4.2, 2.5, 6.5, 0.1));
-              private final NumberSetting fov = addSetting(new NumberSetting("FOV", 110.0, 20.0, 180.0, 5.0));
-              private final NumberSetting hSmooth = addSetting(new NumberSetting("H-Smooth", 34.0, 5.0, 95.0, 1.0));
-              private final NumberSetting vSmooth = addSetting(new NumberSetting("V-Smooth", 18.0, 0.0, 80.0, 1.0));
-              private final NumberSetting stickiness = addSetting(new NumberSetting("Stickiness", 0.65, 0.0, 1.0, 0.05));
-              private final NumberSetting prediction = addSetting(new NumberSetting("Prediction", 0.25, 0.0, 1.0, 0.05));
-              private final NumberSetting aimHeight = addSetting(new NumberSetting("Aim Height", 0.72, 0.2, 0.95, 0.02));
-              private final NumberSetting deadzone = addSetting(new NumberSetting("Deadzone Deg", 0.6, 0.0, 4.0, 0.1));
-              private final NumberSetting microDrift = addSetting(new NumberSetting("Micro Drift", 0.04, 0.0, 0.35, 0.01));
-              private final BooleanSetting verticalAim = addSetting(new BooleanSetting("Vertical Aim", true));
+              private final NumberSetting range = addSetting(new NumberSetting("Range", 4.0, 2.5, 6.5, 0.1));
+              private final NumberSetting fov = addSetting(new NumberSetting("FOV", 105.0, 20.0, 180.0, 5.0));
+              private final NumberSetting hSmooth = addSetting(new NumberSetting("H-Smooth", 22.0, 5.0, 95.0, 1.0));
+              private final NumberSetting vSmooth = addSetting(new NumberSetting("V-Smooth", 8.0, 0.0, 80.0, 1.0));
+              private final NumberSetting stickiness = addSetting(new NumberSetting("Stickiness", 0.80, 0.0, 1.0, 0.05));
+              private final NumberSetting prediction = addSetting(new NumberSetting("Prediction", 0.05, 0.0, 1.0, 0.05));
+              private final NumberSetting aimHeight = addSetting(new NumberSetting("Aim Height", 0.65, 0.2, 0.95, 0.02));
+              private final NumberSetting deadzone = addSetting(new NumberSetting("Deadzone Deg", 1.0, 0.0, 4.0, 0.1));
+              private final NumberSetting microDrift = addSetting(new NumberSetting("Micro Drift", 0.0, 0.0, 0.35, 0.01));
+              private final BooleanSetting verticalAim = addSetting(new BooleanSetting("Vertical Aim", false));
               private final BooleanSetting lockClosestCrosshair = addSetting(new BooleanSetting("Prioritize Center", true));
               private final BooleanSetting playersOnly = addSetting(new BooleanSetting("Players Only", true));
               private final BooleanSetting ignoreInvis = addSetting(new BooleanSetting("Ignore Invis", false));
 
               private LivingEntity stickyTarget = null;
-              private float smoothYawVel = 0.0f;
-              private float smoothPitchVel = 0.0f;
 
               public AimAssistModule() {
-                  super("AimAssist", "Sticky, velocity-predicted smooth aim assist without click-gating.", Category.COMBAT);
+                  super("AimAssist", "Smooth, non-shaky aim assist without click-gating.", Category.COMBAT);
               }
 
               @Override
               protected void onDisable() {
                   stickyTarget = null;
-                  smoothYawVel = 0.0f;
-                  smoothPitchVel = 0.0f;
               }
 
               @Override
@@ -458,13 +454,11 @@ jobs:
 
                   if (candidates.isEmpty()) {
                       stickyTarget = null;
-                      decayVelocity();
                       return;
                   }
 
                   LivingEntity chosen = selectTarget(self, candidates);
                   if (chosen == null) {
-                      decayVelocity();
                       return;
                   }
                   stickyTarget = chosen;
@@ -472,8 +466,7 @@ jobs:
                   Vec3d eyePos = self.getEyePos();
                   Box box = chosen.getBoundingBox();
 
-                  // Predict target movement slightly so fast strafes stay tracked smoothly
-                  double predTicks = prediction.getValue() * 2.2;
+                  double predTicks = prediction.getValue() * 1.2;
                   Vec3d vel = chosen.getVelocity();
                   double predX = (box.minX + box.maxX) * 0.5 + vel.x * predTicks;
                   double predZ = (box.minZ + box.maxZ) * 0.5 + vel.z * predTicks;
@@ -481,7 +474,7 @@ jobs:
                   double targetY;
                   if (verticalAim.getValue()) {
                       double clampedRatio = MathHelper.clamp(aimHeight.getValue().floatValue(), 0.2f, 0.95f);
-                      targetY = box.minY + (box.maxY - box.minY) * clampedRatio + vel.y * (predTicks * 0.4);
+                      targetY = box.minY + (box.maxY - box.minY) * clampedRatio + vel.y * (predTicks * 0.2);
                   } else {
                       targetY = eyePos.y;
                   }
@@ -497,50 +490,38 @@ jobs:
                   float yawDelta = MathHelper.wrapDegrees(desiredYaw - self.getYaw());
                   float pitchDelta = MathHelper.wrapDegrees(desiredPitch - self.getPitch());
 
-                  // Small deadzone prevents micro-stutter when already lined up
                   float dzDeg = deadzone.getValue().floatValue();
-                  if (Math.abs(yawDelta) < dzDeg) {
-                      yawDelta = 0.0f;
+                  if (Math.abs(yawDelta) <= dzDeg) {
+                      return;
                   }
 
-                  // Critically damped / ease-out tracking: pulls faster when off-target, eases gently near center
-                  double hFactor = MathHelper.clamp(hSmooth.getValue() / 100.0, 0.04, 0.95);
-                  float curveBoost = (float) (0.75 + Math.min(0.85, Math.abs(yawDelta) / 35.0));
-                  float targetYawStep = (float) (yawDelta * hFactor * curveBoost);
+                  double hFactor = MathHelper.clamp(hSmooth.getValue() / 130.0, 0.03, 0.65);
+                  float yawStep = (float) (yawDelta * hFactor);
 
-                  ThreadLocalRandom rng = ThreadLocalRandom.current();
                   float drift = microDrift.getValue().floatValue();
-                  if (drift > 0.0f && Math.abs(yawDelta) > dzDeg) {
-                      targetYawStep += (float) (rng.nextGaussian() * drift);
+                  if (drift > 0.0f) {
+                      yawStep += (float) (ThreadLocalRandom.current().nextGaussian() * drift);
                   }
 
-                  // Spring-like damping so rotation has inertia and never snaps
-                  smoothYawVel = MathHelper.lerp(0.55f, smoothYawVel, targetYawStep);
-                  self.setYaw(self.getYaw() + smoothYawVel);
+                  self.setYaw(self.getYaw() + yawStep);
 
-                  if (verticalAim.getValue() && vSmooth.getValue() > 0.0) {
-                      if (Math.abs(pitchDelta) < dzDeg * 0.8f) {
-                          pitchDelta = 0.0f;
+                  if (verticalAim.getValue() && vSmooth.getValue() > 0.0 && Math.abs(pitchDelta) > dzDeg * 0.8f) {
+                      double vFactor = MathHelper.clamp(vSmooth.getValue() / 150.0, 0.02, 0.55);
+                      float pitchStep = (float) (pitchDelta * vFactor);
+                      if (drift > 0.0f) {
+                          pitchStep += (float) (ThreadLocalRandom.current().nextGaussian() * drift * 0.25f);
                       }
-                      double vFactor = MathHelper.clamp(vSmooth.getValue() / 100.0, 0.02, 0.85);
-                      float targetPitchStep = (float) (pitchDelta * vFactor * 0.85f);
-                      if (drift > 0.0f && Math.abs(pitchDelta) > dzDeg) {
-                          targetPitchStep += (float) (rng.nextGaussian() * drift * 0.35f);
-                      }
-                      smoothPitchVel = MathHelper.lerp(0.45f, smoothPitchVel, targetPitchStep);
-                      self.setPitch(MathHelper.clamp(self.getPitch() + smoothPitchVel, -90.0f, 90.0f));
+                      self.setPitch(MathHelper.clamp(self.getPitch() + pitchStep, -90.0f, 90.0f));
                   }
               }
 
               private LivingEntity selectTarget(PlayerEntity self, List<LivingEntity> candidates) {
                   double halfFov = fov.getValue() * 0.5;
 
-                  // Keep current sticky target if still valid and within a slightly wider retention FOV
                   if (stickyTarget != null && candidates.contains(stickyTarget)) {
                       double stickAngle = angleToEntity(self, stickyTarget);
                       double keepLimit = halfFov * (1.0 + stickiness.getValue() * 0.35);
                       if (stickAngle <= keepLimit) {
-                          // If another target is MUCH closer to crosshair and stickiness is low, allow switch
                           if (!lockClosestCrosshair.getValue()) {
                               return stickyTarget;
                           }
@@ -585,11 +566,6 @@ jobs:
                   float targetYaw = (float) (MathHelper.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0f;
                   return Math.abs(MathHelper.wrapDegrees(targetYaw - self.getYaw()));
               }
-
-              private void decayVelocity() {
-                  smoothYawVel *= 0.5f;
-                  smoothPitchVel *= 0.5f;
-              }
           }
           EOF
 
@@ -611,10 +587,10 @@ jobs:
 
           public class TriggerBotModule extends Module {
               private final NumberSetting minCps = addSetting(new NumberSetting("Min CPS", 8.0, 1.0, 20.0, 0.5));
-              private final NumberSetting maxCps = addSetting(new NumberSetting("Max CPS", 12.0, 1.0, 20.0, 0.5));
+              private final NumberSetting maxCps = addSetting(new NumberSetting("Max CPS", 11.5, 1.0, 20.0, 0.5));
               private final NumberSetting reactionMs = addSetting(new NumberSetting("Reaction ms", 35.0, 0.0, 180.0, 5.0));
-              private final NumberSetting cooldownReq = addSetting(new NumberSetting("Cooldown Req", 0.94, 0.5, 1.0, 0.01));
-              private final NumberSetting hitChance = addSetting(new NumberSetting("Hit Chance %", 100.0, 10.0, 100.0, 1.0));
+              private final NumberSetting cooldownReq = addSetting(new NumberSetting("Cooldown Req", 0.95, 0.5, 1.0, 0.01));
+              private final NumberSetting hitChance = addSetting(new NumberSetting("Hit Chance %", 98.0, 10.0, 100.0, 1.0));
               private final BooleanSetting onlyCrits = addSetting(new BooleanSetting("Only Crits", false));
               private final BooleanSetting smartCrits = addSetting(new BooleanSetting("Smart Crits", true));
               private final BooleanSetting requireSprint = addSetting(new BooleanSetting("Require Sprint", false));
@@ -671,7 +647,6 @@ jobs:
                       targetAcquiredAtMs = now;
                   }
 
-                  // Human-like reaction delay after target enters crosshair
                   double jitterFactor = 0.75 + ThreadLocalRandom.current().nextDouble() * 0.50;
                   long neededDelay = (long) (reactionMs.getValue() * jitterFactor);
                   if (now - targetAcquiredAtMs < neededDelay) {
@@ -680,7 +655,6 @@ jobs:
 
                   if (now < nextAllowedAttackMs) return;
 
-                  // Wait for 1.21 weapon cooldown so attacks deal full damage instead of weak spam hits
                   float cooldown = client.player.getAttackCooldownProgress(0.5f);
                   if (cooldown < cooldownReq.getValue().floatValue()) {
                       return;
@@ -690,7 +664,6 @@ jobs:
                   if (onlyCrits.getValue()) {
                       if (!canCritNow) return;
                   } else if (smartCrits.getValue()) {
-                      // If player is mid-air going up or just started falling, wait briefly for crit fall if near ground/jump
                       boolean risingFromJump = !client.player.isOnGround() && client.player.getVelocity().y > 0.05 && client.player.fallDistance < 0.25f;
                       if (risingFromJump) {
                           return;
