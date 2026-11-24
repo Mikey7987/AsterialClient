@@ -405,97 +405,190 @@ jobs:
           import net.minecraft.client.MinecraftClient;
           import net.minecraft.entity.LivingEntity;
           import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.util.math.Box;
           import net.minecraft.util.math.MathHelper;
           import net.minecraft.util.math.Vec3d;
 
           import java.util.Comparator;
+          import java.util.List;
           import java.util.concurrent.ThreadLocalRandom;
 
           public class AimAssistModule extends Module {
-              private final NumberSetting range = addSetting(new NumberSetting("Range", 3.6, 2.5, 6.0, 0.1));
-              private final NumberSetting fov = addSetting(new NumberSetting("FOV", 75.0, 15.0, 180.0, 5.0));
-              private final NumberSetting horizontalSpeed = addSetting(new NumberSetting("H-Speed", 18.0, 2.0, 80.0, 1.0));
-              private final NumberSetting verticalSpeed = addSetting(new NumberSetting("V-Speed", 8.0, 0.0, 60.0, 1.0));
-              private final NumberSetting jitter = addSetting(new NumberSetting("Jitter", 0.35, 0.0, 2.0, 0.05));
-              private final BooleanSetting onlyOnAttack = addSetting(new BooleanSetting("Only On Attack", true));
+              private final NumberSetting range = addSetting(new NumberSetting("Range", 4.2, 2.5, 6.5, 0.1));
+              private final NumberSetting fov = addSetting(new NumberSetting("FOV", 110.0, 20.0, 180.0, 5.0));
+              private final NumberSetting hSmooth = addSetting(new NumberSetting("H-Smooth", 34.0, 5.0, 95.0, 1.0));
+              private final NumberSetting vSmooth = addSetting(new NumberSetting("V-Smooth", 18.0, 0.0, 80.0, 1.0));
+              private final NumberSetting stickiness = addSetting(new NumberSetting("Stickiness", 0.65, 0.0, 1.0, 0.05));
+              private final NumberSetting prediction = addSetting(new NumberSetting("Prediction", 0.25, 0.0, 1.0, 0.05));
+              private final NumberSetting aimHeight = addSetting(new NumberSetting("Aim Height", 0.72, 0.2, 0.95, 0.02));
+              private final NumberSetting deadzone = addSetting(new NumberSetting("Deadzone Deg", 0.6, 0.0, 4.0, 0.1));
+              private final NumberSetting microDrift = addSetting(new NumberSetting("Micro Drift", 0.04, 0.0, 0.35, 0.01));
               private final BooleanSetting verticalAim = addSetting(new BooleanSetting("Vertical Aim", true));
+              private final BooleanSetting lockClosestCrosshair = addSetting(new BooleanSetting("Prioritize Center", true));
               private final BooleanSetting playersOnly = addSetting(new BooleanSetting("Players Only", true));
+              private final BooleanSetting ignoreInvis = addSetting(new BooleanSetting("Ignore Invis", false));
+
+              private LivingEntity stickyTarget = null;
+              private float smoothYawVel = 0.0f;
+              private float smoothPitchVel = 0.0f;
 
               public AimAssistModule() {
-                  super("AimAssist", "Smooth yaw/pitch assist with FOV & jitter.", Category.COMBAT);
+                  super("AimAssist", "Sticky, velocity-predicted smooth aim assist without click-gating.", Category.COMBAT);
+              }
+
+              @Override
+              protected void onDisable() {
+                  stickyTarget = null;
+                  smoothYawVel = 0.0f;
+                  smoothPitchVel = 0.0f;
               }
 
               @Override
               public void onTick(MinecraftClient client) {
                   if (client.player == null || client.world == null) return;
-                  if (onlyOnAttack.getValue() && !client.options.attackKey.isPressed()) return;
 
                   PlayerEntity self = client.player;
-                  LivingEntity target = client.world.getEntitiesByClass(
-                                  LivingEntity.class,
-                                  self.getBoundingBox().expand(range.getValue()),
-                                  entity -> isValidTarget(self, entity)
-                          ).stream()
-                          .min(Comparator.comparingDouble(e -> angleDelta(self, e)))
-                          .orElse(null);
+                  double maxDist = range.getValue();
 
-                  if (target == null) return;
+                  List<LivingEntity> candidates = client.world.getEntitiesByClass(
+                          LivingEntity.class,
+                          self.getBoundingBox().expand(maxDist + 0.5),
+                          entity -> isValidCandidate(self, entity, maxDist)
+                  );
 
-                  Vec3d eyePos = self.getEyePos();
-                  Vec3d aimPoint = target.getBoundingBox().getCenter();
-                  if (verticalAim.getValue()) {
-                      aimPoint = new Vec3d(aimPoint.x, target.getY() + target.getHeight() * 0.65, aimPoint.z);
-                  } else {
-                      aimPoint = new Vec3d(aimPoint.x, eyePos.y, aimPoint.z);
+                  if (candidates.isEmpty()) {
+                      stickyTarget = null;
+                      decayVelocity();
+                      return;
                   }
 
-                  double dx = aimPoint.x - eyePos.x;
-                  double dy = aimPoint.y - eyePos.y;
-                  double dz = aimPoint.z - eyePos.z;
-                  double horizDist = Math.sqrt(dx * dx + dz * dz);
+                  LivingEntity chosen = selectTarget(self, candidates);
+                  if (chosen == null) {
+                      decayVelocity();
+                      return;
+                  }
+                  stickyTarget = chosen;
 
-                  float targetYaw = (float) (MathHelper.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0f;
-                  float targetPitch = (float) (-(MathHelper.atan2(dy, horizDist) * (180.0 / Math.PI)));
+                  Vec3d eyePos = self.getEyePos();
+                  Box box = chosen.getBoundingBox();
 
-                  float yawDiff = MathHelper.wrapDegrees(targetYaw - self.getYaw());
-                  float pitchDiff = MathHelper.wrapDegrees(targetPitch - self.getPitch());
+                  // Predict target movement slightly so fast strafes stay tracked smoothly
+                  double predTicks = prediction.getValue() * 2.2;
+                  Vec3d vel = chosen.getVelocity();
+                  double predX = (box.minX + box.maxX) * 0.5 + vel.x * predTicks;
+                  double predZ = (box.minZ + box.maxZ) * 0.5 + vel.z * predTicks;
 
-                  if (Math.abs(yawDiff) > fov.getValue() * 0.5) return;
+                  double targetY;
+                  if (verticalAim.getValue()) {
+                      double clampedRatio = MathHelper.clamp(aimHeight.getValue().floatValue(), 0.2f, 0.95f);
+                      targetY = box.minY + (box.maxY - box.minY) * clampedRatio + vel.y * (predTicks * 0.4);
+                  } else {
+                      targetY = eyePos.y;
+                  }
+
+                  double dx = predX - eyePos.x;
+                  double dy = targetY - eyePos.y;
+                  double dz = predZ - eyePos.z;
+                  double horizDist = Math.max(0.05, Math.sqrt(dx * dx + dz * dz));
+
+                  float desiredYaw = (float) (MathHelper.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0f;
+                  float desiredPitch = (float) (-(MathHelper.atan2(dy, horizDist) * (180.0 / Math.PI)));
+
+                  float yawDelta = MathHelper.wrapDegrees(desiredYaw - self.getYaw());
+                  float pitchDelta = MathHelper.wrapDegrees(desiredPitch - self.getPitch());
+
+                  // Small deadzone prevents micro-stutter when already lined up
+                  float dzDeg = deadzone.getValue().floatValue();
+                  if (Math.abs(yawDelta) < dzDeg) {
+                      yawDelta = 0.0f;
+                  }
+
+                  // Critically damped / ease-out tracking: pulls faster when off-target, eases gently near center
+                  double hFactor = MathHelper.clamp(hSmooth.getValue() / 100.0, 0.04, 0.95);
+                  float curveBoost = (float) (0.75 + Math.min(0.85, Math.abs(yawDelta) / 35.0));
+                  float targetYawStep = (float) (yawDelta * hFactor * curveBoost);
 
                   ThreadLocalRandom rng = ThreadLocalRandom.current();
-                  double randFactor = 0.85 + rng.nextDouble() * 0.30;
-
-                  float maxYawStep = (float) (horizontalSpeed.getValue() * 0.12 * randFactor);
-                  float yawStep = MathHelper.clamp(yawDiff, -maxYawStep, maxYawStep);
-                  if (jitter.getValue() > 0.0) {
-                      yawStep += (float) rng.nextGaussian() * jitter.getValue().floatValue();
+                  float drift = microDrift.getValue().floatValue();
+                  if (drift > 0.0f && Math.abs(yawDelta) > dzDeg) {
+                      targetYawStep += (float) (rng.nextGaussian() * drift);
                   }
 
-                  self.setYaw(self.getYaw() + yawStep);
+                  // Spring-like damping so rotation has inertia and never snaps
+                  smoothYawVel = MathHelper.lerp(0.55f, smoothYawVel, targetYawStep);
+                  self.setYaw(self.getYaw() + smoothYawVel);
 
-                  if (verticalAim.getValue() && verticalSpeed.getValue() > 0.0) {
-                      float maxPitchStep = (float) (verticalSpeed.getValue() * 0.12 * randFactor);
-                      float pitchStep = MathHelper.clamp(pitchDiff, -maxPitchStep, maxPitchStep);
-                      if (jitter.getValue() > 0.0) {
-                          pitchStep += (float) (rng.nextGaussian() * jitter.getValue().floatValue() * 0.5);
+                  if (verticalAim.getValue() && vSmooth.getValue() > 0.0) {
+                      if (Math.abs(pitchDelta) < dzDeg * 0.8f) {
+                          pitchDelta = 0.0f;
                       }
-                      self.setPitch(MathHelper.clamp(self.getPitch() + pitchStep, -90.0f, 90.0f));
+                      double vFactor = MathHelper.clamp(vSmooth.getValue() / 100.0, 0.02, 0.85);
+                      float targetPitchStep = (float) (pitchDelta * vFactor * 0.85f);
+                      if (drift > 0.0f && Math.abs(pitchDelta) > dzDeg) {
+                          targetPitchStep += (float) (rng.nextGaussian() * drift * 0.35f);
+                      }
+                      smoothPitchVel = MathHelper.lerp(0.45f, smoothPitchVel, targetPitchStep);
+                      self.setPitch(MathHelper.clamp(self.getPitch() + smoothPitchVel, -90.0f, 90.0f));
                   }
               }
 
-              private boolean isValidTarget(PlayerEntity self, LivingEntity entity) {
-                  if (entity == self || !entity.isAlive() || entity.isSpectator()) return false;
-                  if (playersOnly.getValue() && !(entity instanceof PlayerEntity)) return false;
-                  return self.canSee(entity) && self.distanceTo(entity) <= range.getValue();
+              private LivingEntity selectTarget(PlayerEntity self, List<LivingEntity> candidates) {
+                  double halfFov = fov.getValue() * 0.5;
+
+                  // Keep current sticky target if still valid and within a slightly wider retention FOV
+                  if (stickyTarget != null && candidates.contains(stickyTarget)) {
+                      double stickAngle = angleToEntity(self, stickyTarget);
+                      double keepLimit = halfFov * (1.0 + stickiness.getValue() * 0.35);
+                      if (stickAngle <= keepLimit) {
+                          // If another target is MUCH closer to crosshair and stickiness is low, allow switch
+                          if (!lockClosestCrosshair.getValue()) {
+                              return stickyTarget;
+                          }
+                          LivingEntity best = candidates.stream()
+                                  .filter(e -> angleToEntity(self, e) <= halfFov)
+                                  .min(Comparator.comparingDouble(e -> targetScore(self, e)))
+                                  .orElse(stickyTarget);
+                          if (best == stickyTarget) return stickyTarget;
+                          double bestScore = targetScore(self, best);
+                          double currentScore = targetScore(self, stickyTarget);
+                          if (bestScore < currentScore * (0.55 - stickiness.getValue() * 0.35)) {
+                              return best;
+                          }
+                          return stickyTarget;
+                      }
+                  }
+
+                  return candidates.stream()
+                          .filter(e -> angleToEntity(self, e) <= halfFov)
+                          .min(Comparator.comparingDouble(e -> targetScore(self, e)))
+                          .orElse(null);
               }
 
-              private double angleDelta(PlayerEntity self, LivingEntity entity) {
+              private double targetScore(PlayerEntity self, LivingEntity entity) {
+                  double ang = angleToEntity(self, entity);
+                  double dist = self.distanceTo(entity);
+                  return ang * 1.35 + dist * 2.5;
+              }
+
+              private boolean isValidCandidate(PlayerEntity self, LivingEntity entity, double maxDist) {
+                  if (entity == null || entity == self || !entity.isAlive() || entity.isSpectator()) return false;
+                  if (playersOnly.getValue() && !(entity instanceof PlayerEntity)) return false;
+                  if (ignoreInvis.getValue() && entity.isInvisible()) return false;
+                  return self.distanceTo(entity) <= maxDist;
+              }
+
+              private double angleToEntity(PlayerEntity self, LivingEntity entity) {
                   Vec3d eyePos = self.getEyePos();
-                  Vec3d targetPos = entity.getBoundingBox().getCenter();
-                  double dx = targetPos.x - eyePos.x;
-                  double dz = targetPos.z - eyePos.z;
+                  Vec3d center = entity.getBoundingBox().getCenter();
+                  double dx = center.x - eyePos.x;
+                  double dz = center.z - eyePos.z;
                   float targetYaw = (float) (MathHelper.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0f;
                   return Math.abs(MathHelper.wrapDegrees(targetYaw - self.getYaw()));
+              }
+
+              private void decayVelocity() {
+                  smoothYawVel *= 0.5f;
+                  smoothPitchVel *= 0.5f;
               }
           }
           EOF
@@ -517,52 +610,134 @@ jobs:
           import java.util.concurrent.ThreadLocalRandom;
 
           public class TriggerBotModule extends Module {
-              private final NumberSetting minCps = addSetting(new NumberSetting("Min CPS", 9.0, 1.0, 20.0, 0.5));
-              private final NumberSetting maxCps = addSetting(new NumberSetting("Max CPS", 13.0, 1.0, 20.0, 0.5));
-              private final NumberSetting jitterMs = addSetting(new NumberSetting("Jitter ms", 18.0, 0.0, 80.0, 1.0));
-              private final NumberSetting cooldownThreshold = addSetting(new NumberSetting("Cooldown", 0.92, 0.1, 1.0, 0.02));
+              private final NumberSetting minCps = addSetting(new NumberSetting("Min CPS", 8.0, 1.0, 20.0, 0.5));
+              private final NumberSetting maxCps = addSetting(new NumberSetting("Max CPS", 12.0, 1.0, 20.0, 0.5));
+              private final NumberSetting reactionMs = addSetting(new NumberSetting("Reaction ms", 35.0, 0.0, 180.0, 5.0));
+              private final NumberSetting cooldownReq = addSetting(new NumberSetting("Cooldown Req", 0.94, 0.5, 1.0, 0.01));
+              private final NumberSetting hitChance = addSetting(new NumberSetting("Hit Chance %", 100.0, 10.0, 100.0, 1.0));
               private final BooleanSetting onlyCrits = addSetting(new BooleanSetting("Only Crits", false));
+              private final BooleanSetting smartCrits = addSetting(new BooleanSetting("Smart Crits", true));
               private final BooleanSetting requireSprint = addSetting(new BooleanSetting("Require Sprint", false));
+              private final BooleanSetting stopSprintOnCrit = addSetting(new BooleanSetting("Stop Sprint Crit", false));
+              private final BooleanSetting respectShield = addSetting(new BooleanSetting("Respect Shield", true));
               private final BooleanSetting playersOnly = addSetting(new BooleanSetting("Players Only", true));
+              private final BooleanSetting swingOnlyOnHit = addSetting(new BooleanSetting("Swing On Hit", true));
 
-              private long nextAttackTimeMs = 0L;
+              private long targetAcquiredAtMs = -1L;
+              private long nextAllowedAttackMs = 0L;
+              private int lastTargetId = -1;
 
               public TriggerBotModule() {
-                  super("TriggerBot", "Swings on crosshair target with randomized CPS & cooldown sync.", Category.COMBAT);
+                  super("TriggerBot", "1.21 cooldown-aware triggerbot with reaction delay, crit sync & shield checks.", Category.COMBAT);
+              }
+
+              @Override
+              protected void onDisable() {
+                  targetAcquiredAtMs = -1L;
+                  lastTargetId = -1;
               }
 
               @Override
               public void onTick(MinecraftClient client) {
                   if (client.player == null || client.interactionManager == null) return;
-                  if (!(client.crosshairTarget instanceof EntityHitResult hitResult)) return;
 
-                  Entity target = hitResult.getEntity();
-                  if (!(target instanceof LivingEntity living) || !living.isAlive() || target.isSpectator()) return;
-                  if (playersOnly.getValue() && !(target instanceof PlayerEntity)) return;
-
-                  if (requireSprint.getValue() && !client.player.isSprinting()) return;
-
-                  if (onlyCrits.getValue()) {
-                      boolean falling = client.player.fallDistance > 0.0f && !client.player.isOnGround() && !client.player.isClimbing();
-                      if (!falling) return;
+                  if (!(client.crosshairTarget instanceof EntityHitResult hitResult)) {
+                      targetAcquiredAtMs = -1L;
+                      lastTargetId = -1;
+                      return;
                   }
 
-                  if (client.player.getAttackCooldownProgress(0.5f) < cooldownThreshold.getValue().floatValue()) {
+                  Entity target = hitResult.getEntity();
+                  if (!(target instanceof LivingEntity living) || !living.isAlive() || target.isSpectator()) {
+                      targetAcquiredAtMs = -1L;
+                      lastTargetId = -1;
+                      return;
+                  }
+
+                  if (playersOnly.getValue() && !(target instanceof PlayerEntity)) {
+                      targetAcquiredAtMs = -1L;
+                      return;
+                  }
+
+                  if (respectShield.getValue() && target instanceof PlayerEntity targetPlayer && targetPlayer.isBlocking()) {
                       return;
                   }
 
                   long now = System.currentTimeMillis();
-                  if (now < nextAttackTimeMs) return;
+                  if (target.getId() != lastTargetId) {
+                      lastTargetId = target.getId();
+                      targetAcquiredAtMs = now;
+                  } else if (targetAcquiredAtMs == -1L) {
+                      targetAcquiredAtMs = now;
+                  }
+
+                  // Human-like reaction delay after target enters crosshair
+                  double jitterFactor = 0.75 + ThreadLocalRandom.current().nextDouble() * 0.50;
+                  long neededDelay = (long) (reactionMs.getValue() * jitterFactor);
+                  if (now - targetAcquiredAtMs < neededDelay) {
+                      return;
+                  }
+
+                  if (now < nextAllowedAttackMs) return;
+
+                  // Wait for 1.21 weapon cooldown so attacks deal full damage instead of weak spam hits
+                  float cooldown = client.player.getAttackCooldownProgress(0.5f);
+                  if (cooldown < cooldownReq.getValue().floatValue()) {
+                      return;
+                  }
+
+                  boolean canCritNow = isFallingCritWindow(client);
+                  if (onlyCrits.getValue()) {
+                      if (!canCritNow) return;
+                  } else if (smartCrits.getValue()) {
+                      // If player is mid-air going up or just started falling, wait briefly for crit fall if near ground/jump
+                      boolean risingFromJump = !client.player.isOnGround() && client.player.getVelocity().y > 0.05 && client.player.fallDistance < 0.25f;
+                      if (risingFromJump) {
+                          return;
+                      }
+                  }
+
+                  if (requireSprint.getValue() && !client.player.isSprinting()) {
+                      return;
+                  }
+
+                  if (hitChance.getValue() < 100.0) {
+                      double roll = ThreadLocalRandom.current().nextDouble() * 100.0;
+                      if (roll > hitChance.getValue()) {
+                          scheduleNextClick(now);
+                          return;
+                      }
+                  }
+
+                  if (stopSprintOnCrit.getValue() && canCritNow && client.player.isSprinting()) {
+                      client.player.setSprinting(false);
+                  }
 
                   client.interactionManager.attackEntity(client.player, target);
-                  client.player.swingHand(Hand.MAIN_HAND);
+                  if (swingOnlyOnHit.getValue()) {
+                      client.player.swingHand(Hand.MAIN_HAND);
+                  }
 
+                  scheduleNextClick(now);
+              }
+
+              private boolean isFallingCritWindow(MinecraftClient client) {
+                  if (client.player == null) return false;
+                  return client.player.fallDistance > 0.0f
+                          && !client.player.isOnGround()
+                          && !client.player.isClimbing()
+                          && !client.player.isTouchingWater()
+                          && !client.player.isInLava()
+                          && !client.player.hasVehicle();
+              }
+
+              private void scheduleNextClick(long now) {
                   double low = Math.min(minCps.getValue(), maxCps.getValue());
                   double high = Math.max(minCps.getValue(), maxCps.getValue());
                   double cps = low + ThreadLocalRandom.current().nextDouble() * (high - low);
-                  long baseInterval = (long) (1000.0 / Math.max(1.0, cps));
-                  long randomOffset = (long) (ThreadLocalRandom.current().nextGaussian() * jitterMs.getValue() * 0.5);
-                  nextAttackTimeMs = now + Math.max(35L, baseInterval + randomOffset);
+                  long intervalMs = (long) (1000.0 / Math.max(1.0, cps));
+                  long gaussianOffset = (long) (ThreadLocalRandom.current().nextGaussian() * 10.0);
+                  nextAllowedAttackMs = now + Math.max(50L, intervalMs + gaussianOffset);
               }
           }
           EOF
@@ -585,29 +760,44 @@ jobs:
           import java.util.concurrent.ThreadLocalRandom;
 
           public class AutoShieldBreakerModule extends Module {
-              private final NumberSetting minDelayMs = addSetting(new NumberSetting("Min Delay ms", 45.0, 0.0, 250.0, 5.0));
-              private final NumberSetting maxDelayMs = addSetting(new NumberSetting("Max Delay ms", 110.0, 5.0, 350.0, 5.0));
+              private final NumberSetting minDelayMs = addSetting(new NumberSetting("Min Delay ms", 40.0, 0.0, 250.0, 5.0));
+              private final NumberSetting maxDelayMs = addSetting(new NumberSetting("Max Delay ms", 95.0, 5.0, 350.0, 5.0));
+              private final NumberSetting swapBackDelayMs = addSetting(new NumberSetting("SwapBack ms", 60.0, 0.0, 300.0, 10.0));
+              private final NumberSetting cooldownReq = addSetting(new NumberSetting("Cooldown Req", 0.90, 0.5, 1.0, 0.02));
               private final BooleanSetting autoSwapAxe = addSetting(new BooleanSetting("Auto Swap Axe", true));
               private final BooleanSetting swapBack = addSetting(new BooleanSetting("Swap Back", true));
+              private final BooleanSetting swingHand = addSetting(new BooleanSetting("Swing Hand", true));
 
               private long shieldDetectedAtMs = -1L;
               private long scheduledBreakAtMs = -1L;
+              private long swapBackAtMs = -1L;
               private int previousSlot = -1;
               private boolean swapped = false;
 
               public AutoShieldBreakerModule() {
-                  super("AutoShieldBreaker", "Swaps to an axe with delay to break blocking shields.", Category.COMBAT);
+                  super("AutoShieldBreaker", "Timed axe swap and shield break with customizable return delay.", Category.COMBAT);
+              }
+
+              @Override
+              protected void onDisable() {
+                  resetSchedule();
+                  previousSlot = -1;
+                  swapped = false;
+                  swapBackAtMs = -1L;
               }
 
               @Override
               public void onTick(MinecraftClient client) {
                   if (client.player == null || client.interactionManager == null) return;
 
+                  long now = System.currentTimeMillis();
+
                   if (swapped && swapBack.getValue() && previousSlot != -1) {
-                      if (client.player.getAttackCooldownProgress(0.5f) >= 0.95f) {
+                      if (swapBackAtMs != -1L && now >= swapBackAtMs && client.player.getAttackCooldownProgress(0.5f) >= 0.75f) {
                           client.player.getInventory().setSelectedSlot(previousSlot);
                           previousSlot = -1;
                           swapped = false;
+                          swapBackAtMs = -1L;
                       }
                   }
 
@@ -622,7 +812,6 @@ jobs:
                       return;
                   }
 
-                  long now = System.currentTimeMillis();
                   if (shieldDetectedAtMs == -1L) {
                       shieldDetectedAtMs = now;
                       double low = Math.min(minDelayMs.getValue(), maxDelayMs.getValue());
@@ -643,9 +832,12 @@ jobs:
                       swapped = true;
                   }
 
-                  if (client.player.getAttackCooldownProgress(0.5f) >= 0.85f) {
+                  if (client.player.getAttackCooldownProgress(0.5f) >= cooldownReq.getValue().floatValue()) {
                       client.interactionManager.attackEntity(client.player, targetPlayer);
-                      client.player.swingHand(Hand.MAIN_HAND);
+                      if (swingHand.getValue()) {
+                          client.player.swingHand(Hand.MAIN_HAND);
+                      }
+                      swapBackAtMs = now + swapBackDelayMs.getValue().longValue();
                       resetSchedule();
                   }
               }
@@ -684,10 +876,12 @@ jobs:
           import java.util.concurrent.ThreadLocalRandom;
 
           public class AutoJumpResetModule extends Module {
-              private final NumberSetting chance = addSetting(new NumberSetting("Chance %", 75.0, 0.0, 100.0, 5.0));
+              private final NumberSetting chance = addSetting(new NumberSetting("Chance %", 80.0, 0.0, 100.0, 5.0));
               private final NumberSetting tickDelay = addSetting(new NumberSetting("Tick Delay", 1.0, 0.0, 4.0, 1.0));
+              private final NumberSetting minHurtTime = addSetting(new NumberSetting("Min HurtTime", 1.0, 1.0, 10.0, 1.0));
               private final BooleanSetting requireForward = addSetting(new BooleanSetting("Require Forward", true));
               private final BooleanSetting onlyOnGround = addSetting(new BooleanSetting("Only On Ground", true));
+              private final BooleanSetting avoidLiquids = addSetting(new BooleanSetting("Avoid Liquids", true));
 
               private int lastHurtTime = 0;
               private int pendingJumpTicks = -1;
@@ -701,7 +895,7 @@ jobs:
                   if (client.player == null) return;
 
                   int hurtTime = client.player.hurtTime;
-                  if (hurtTime > lastHurtTime && hurtTime > 0) {
+                  if (hurtTime > lastHurtTime && hurtTime >= minHurtTime.getValue().intValue()) {
                       boolean forwardOk = !requireForward.getValue() || client.options.forwardKey.isPressed();
                       boolean groundOk = !onlyOnGround.getValue() || client.player.isOnGround();
                       boolean rollPass = ThreadLocalRandom.current().nextDouble() * 100.0 <= chance.getValue();
@@ -719,7 +913,8 @@ jobs:
 
                   if (pendingJumpTicks == 0) {
                       pendingJumpTicks = -1;
-                      if (client.player.isOnGround() && !client.player.isTouchingWater() && !client.player.isInLava()) {
+                      boolean liquidBlocked = avoidLiquids.getValue() && (client.player.isTouchingWater() || client.player.isInLava());
+                      if (client.player.isOnGround() && !liquidBlocked) {
                           client.player.jump();
                       }
                   }
@@ -749,7 +944,7 @@ jobs:
           import java.util.Map;
 
           public class ClickGuiScreen extends Screen {
-              private static final int PANEL_WIDTH = 132;
+              private static final int PANEL_WIDTH = 138;
               private static final int HEADER_HEIGHT = 20;
               private static final int MODULE_HEIGHT = 16;
               private static final int SETTING_HEIGHT = 14;
@@ -778,11 +973,11 @@ jobs:
                   super(Text.literal("Velour ClickGUI"));
                   this.moduleManager = moduleManager;
 
-                  int startX = 24;
-                  int startY = 28;
+                  int startX = 20;
+                  int startY = 24;
                   for (Category cat : Category.values()) {
                       panelPositions.put(cat, new int[]{startX, startY});
-                      startX += PANEL_WIDTH + 18;
+                      startX += PANEL_WIDTH + 16;
                   }
               }
 
