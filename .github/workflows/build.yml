@@ -1,0 +1,995 @@
+name: Build Velour 1.21.11 All-In-One
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Install Gradle 8.11
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Generate Project Files
+        run: |
+          mkdir -p src/main/java/com/velour/client/module/setting
+          mkdir -p src/main/java/com/velour/client/module/impl
+          mkdir -p src/main/java/com/velour/client/gui
+          mkdir -p src/main/resources
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+          minecraft_version=1.21.11
+          yarn_mappings=1.21.11+build.1
+          loader_version=0.16.10
+          fabric_version=0.115.0+1.21.11
+          mod_version=1.0.0
+          maven_group=com.velour
+          archives_base_name=velour-1.21.11
+          EOF
+
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'fabric-loom' version '1.9-SNAPSHOT'
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+              mavenCentral()
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+
+          cat << 'EOF' > src/main/resources/fabric.mod.json
+          {
+            "schemaVersion": 1,
+            "id": "velour",
+            "version": "${version}",
+            "name": "Velour",
+            "description": "1.21.11 Fabric PvP client with Right Shift ClickGUI.",
+            "authors": ["Velour"],
+            "environment": "client",
+            "entrypoints": {
+              "client": [
+                "com.velour.client.VelourClient"
+              ]
+            },
+            "depends": {
+              "fabricloader": ">=0.16.10",
+              "minecraft": "~1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/velour/client/VelourClient.java
+          package com.velour.client;
+
+          import com.velour.client.gui.ClickGuiScreen;
+          import com.velour.client.module.ModuleManager;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import org.lwjgl.glfw.GLFW;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          public class VelourClient implements ClientModInitializer {
+              public static final String MOD_ID = "velour";
+              public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
+
+              private static VelourClient instance;
+              private ModuleManager moduleManager;
+              private KeyBinding clickGuiKey;
+              private boolean rightShiftWasDown = false;
+
+              @Override
+              public void onInitializeClient() {
+                  instance = this;
+                  this.moduleManager = new ModuleManager();
+
+                  this.clickGuiKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                          "key.velour.clickgui",
+                          InputUtil.Type.KEYSYM,
+                          GLFW.GLFW_KEY_RIGHT_SHIFT,
+                          "category.velour.general"
+                  ));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(this::onClientTick);
+                  LOGGER.info("Velour 1.21.11 initialized.");
+              }
+
+              private void onClientTick(MinecraftClient client) {
+                  if (client.player == null) return;
+
+                  long windowHandle = client.getWindow().getHandle();
+                  boolean rightShiftDown = GLFW.glfwGetKey(windowHandle, GLFW.GLFW_KEY_RIGHT_SHIFT) == GLFW.GLFW_PRESS;
+
+                  if ((clickGuiKey.wasPressed() || (rightShiftDown && !rightShiftWasDown)) && client.currentScreen == null) {
+                      client.setScreen(new ClickGuiScreen(moduleManager));
+                  }
+                  rightShiftWasDown = rightShiftDown;
+
+                  if (client.currentScreen == null) {
+                      moduleManager.onTick(client);
+                  }
+              }
+
+              public static VelourClient getInstance() {
+                  return instance;
+              }
+
+              public ModuleManager getModuleManager() {
+                  return moduleManager;
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/velour/client/module/Category.java
+          package com.velour.client.module;
+
+          public enum Category {
+              COMBAT("Combat"),
+              MOVEMENT("Movement");
+
+              private final String displayName;
+
+              Category(String displayName) {
+                  this.displayName = displayName;
+              }
+
+              public String getDisplayName() {
+                  return displayName;
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/velour/client/module/Module.java
+          package com.velour.client.module;
+
+          import com.velour.client.module.setting.Setting;
+          import net.minecraft.client.MinecraftClient;
+
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.List;
+
+          public abstract class Module {
+              private final String name;
+              private final String description;
+              private final Category category;
+              private final List<Setting<?>> settings = new ArrayList<>();
+              private boolean enabled;
+
+              protected Module(String name, String description, Category category) {
+                  this.name = name;
+                  this.description = description;
+                  this.category = category;
+              }
+
+              protected <T extends Setting<?>> T addSetting(T setting) {
+                  settings.add(setting);
+                  return setting;
+              }
+
+              public List<Setting<?>> getSettings() {
+                  return Collections.unmodifiableList(settings);
+              }
+
+              public String getName() {
+                  return name;
+              }
+
+              public String getDescription() {
+                  return description;
+              }
+
+              public Category getCategory() {
+                  return category;
+              }
+
+              public boolean isEnabled() {
+                  return enabled;
+              }
+
+              public void setEnabled(boolean enabled) {
+                  if (this.enabled == enabled) return;
+                  this.enabled = enabled;
+                  if (enabled) {
+                      onEnable();
+                  } else {
+                      onDisable();
+                  }
+              }
+
+              public void toggle() {
+                  setEnabled(!this.enabled);
+              }
+
+              protected void onEnable() {}
+              protected void onDisable() {}
+              public void onTick(MinecraftClient client) {}
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/velour/client/module/setting/Setting.java
+          package com.velour.client.module.setting;
+
+          public abstract class Setting<T> {
+              private final String name;
+              protected T value;
+
+              protected Setting(String name, T defaultValue) {
+                  this.name = name;
+                  this.value = defaultValue;
+              }
+
+              public String getName() {
+                  return name;
+              }
+
+              public T getValue() {
+                  return value;
+              }
+
+              public void setValue(T value) {
+                  this.value = value;
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/velour/client/module/setting/BooleanSetting.java
+          package com.velour.client.module.setting;
+
+          public class BooleanSetting extends Setting<Boolean> {
+              public BooleanSetting(String name, boolean defaultValue) {
+                  super(name, defaultValue);
+              }
+
+              public void toggle() {
+                  this.value = !this.value;
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/velour/client/module/setting/NumberSetting.java
+          package com.velour.client.module.setting;
+
+          public class NumberSetting extends Setting<Double> {
+              private final double min;
+              private final double max;
+              private final double step;
+
+              public NumberSetting(String name, double defaultValue, double min, double max, double step) {
+                  super(name, defaultValue);
+                  this.min = min;
+                  this.max = max;
+                  this.step = step;
+              }
+
+              public double getMin() {
+                  return min;
+              }
+
+              public double getMax() {
+                  return max;
+              }
+
+              public double getStep() {
+                  return step;
+              }
+
+              @Override
+              public void setValue(Double newVal) {
+                  double clamped = Math.max(min, Math.min(max, newVal));
+                  double snapped = Math.round(clamped / step) * step;
+                  this.value = Math.max(min, Math.min(max, Math.round(snapped * 1000.0) / 1000.0));
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/velour/client/module/ModuleManager.java
+          package com.velour.client.module;
+
+          import com.velour.client.module.impl.AimAssistModule;
+          import com.velour.client.module.impl.AutoJumpResetModule;
+          import com.velour.client.module.impl.AutoShieldBreakerModule;
+          import com.velour.client.module.impl.TriggerBotModule;
+          import net.minecraft.client.MinecraftClient;
+
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.List;
+
+          public class ModuleManager {
+              private final List<Module> modules = new ArrayList<>();
+
+              public ModuleManager() {
+                  modules.add(new AimAssistModule());
+                  modules.add(new TriggerBotModule());
+                  modules.add(new AutoShieldBreakerModule());
+                  modules.add(new AutoJumpResetModule());
+              }
+
+              public List<Module> getModules() {
+                  return Collections.unmodifiableList(modules);
+              }
+
+              public List<Module> getByCategory(Category category) {
+                  List<Module> out = new ArrayList<>();
+                  for (Module m : modules) {
+                      if (m.getCategory() == category) out.add(m);
+                  }
+                  return out;
+              }
+
+              public void onTick(MinecraftClient client) {
+                  for (Module module : modules) {
+                      if (module.isEnabled()) {
+                          module.onTick(client);
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/velour/client/module/impl/AimAssistModule.java
+          package com.velour.client.module.impl;
+
+          import com.velour.client.module.Category;
+          import com.velour.client.module.Module;
+          import com.velour.client.module.setting.BooleanSetting;
+          import com.velour.client.module.setting.NumberSetting;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.entity.LivingEntity;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.util.math.MathHelper;
+          import net.minecraft.util.math.Vec3d;
+
+          import java.util.Comparator;
+          import java.util.concurrent.ThreadLocalRandom;
+
+          public class AimAssistModule extends Module {
+              private final NumberSetting range = addSetting(new NumberSetting("Range", 3.6, 2.5, 6.0, 0.1));
+              private final NumberSetting fov = addSetting(new NumberSetting("FOV", 75.0, 15.0, 180.0, 5.0));
+              private final NumberSetting horizontalSpeed = addSetting(new NumberSetting("H-Speed", 18.0, 2.0, 80.0, 1.0));
+              private final NumberSetting verticalSpeed = addSetting(new NumberSetting("V-Speed", 8.0, 0.0, 60.0, 1.0));
+              private final NumberSetting jitter = addSetting(new NumberSetting("Jitter", 0.35, 0.0, 2.0, 0.05));
+              private final BooleanSetting onlyOnAttack = addSetting(new BooleanSetting("Only On Attack", true));
+              private final BooleanSetting verticalAim = addSetting(new BooleanSetting("Vertical Aim", true));
+              private final BooleanSetting playersOnly = addSetting(new BooleanSetting("Players Only", true));
+
+              public AimAssistModule() {
+                  super("AimAssist", "Smooth yaw/pitch assist with FOV & jitter.", Category.COMBAT);
+              }
+
+              @Override
+              public void onTick(MinecraftClient client) {
+                  if (client.player == null || client.world == null) return;
+                  if (onlyOnAttack.getValue() && !client.options.attackKey.isPressed()) return;
+
+                  PlayerEntity self = client.player;
+                  LivingEntity target = client.world.getEntitiesByClass(
+                                  LivingEntity.class,
+                                  self.getBoundingBox().expand(range.getValue()),
+                                  entity -> isValidTarget(self, entity)
+                          ).stream()
+                          .min(Comparator.comparingDouble(e -> angleDelta(self, e)))
+                          .orElse(null);
+
+                  if (target == null) return;
+
+                  Vec3d eyePos = self.getEyePos();
+                  Vec3d aimPoint = target.getBoundingBox().getCenter();
+                  if (verticalAim.getValue()) {
+                      aimPoint = new Vec3d(aimPoint.x, target.getY() + target.getHeight() * 0.65, aimPoint.z);
+                  } else {
+                      aimPoint = new Vec3d(aimPoint.x, eyePos.y, aimPoint.z);
+                  }
+
+                  double dx = aimPoint.x - eyePos.x;
+                  double dy = aimPoint.y - eyePos.y;
+                  double dz = aimPoint.z - eyePos.z;
+                  double horizDist = Math.sqrt(dx * dx + dz * dz);
+
+                  float targetYaw = (float) (MathHelper.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0f;
+                  float targetPitch = (float) (-(MathHelper.atan2(dy, horizDist) * (180.0 / Math.PI)));
+
+                  float yawDiff = MathHelper.wrapDegrees(targetYaw - self.getYaw());
+                  float pitchDiff = MathHelper.wrapDegrees(targetPitch - self.getPitch());
+
+                  if (Math.abs(yawDiff) > fov.getValue() * 0.5) return;
+
+                  ThreadLocalRandom rng = ThreadLocalRandom.current();
+                  double randFactor = 0.85 + rng.nextDouble() * 0.30;
+
+                  float maxYawStep = (float) (horizontalSpeed.getValue() * 0.12 * randFactor);
+                  float yawStep = MathHelper.clamp(yawDiff, -maxYawStep, maxYawStep);
+                  if (jitter.getValue() > 0.0) {
+                      yawStep += (float) rng.nextGaussian() * jitter.getValue().floatValue();
+                  }
+
+                  self.setYaw(self.getYaw() + yawStep);
+
+                  if (verticalAim.getValue() && verticalSpeed.getValue() > 0.0) {
+                      float maxPitchStep = (float) (verticalSpeed.getValue() * 0.12 * randFactor);
+                      float pitchStep = MathHelper.clamp(pitchDiff, -maxPitchStep, maxPitchStep);
+                      if (jitter.getValue() > 0.0) {
+                          pitchStep += (float) (rng.nextGaussian() * jitter.getValue().floatValue() * 0.5);
+                      }
+                      self.setPitch(MathHelper.clamp(self.getPitch() + pitchStep, -90.0f, 90.0f));
+                  }
+              }
+
+              private boolean isValidTarget(PlayerEntity self, LivingEntity entity) {
+                  if (entity == self || !entity.isAlive() || entity.isSpectator()) return false;
+                  if (playersOnly.getValue() && !(entity instanceof PlayerEntity)) return false;
+                  return self.canSee(entity) && self.distanceTo(entity) <= range.getValue();
+              }
+
+              private double angleDelta(PlayerEntity self, LivingEntity entity) {
+                  Vec3d eyePos = self.getEyePos();
+                  Vec3d targetPos = entity.getBoundingBox().getCenter();
+                  double dx = targetPos.x - eyePos.x;
+                  double dz = targetPos.z - eyePos.z;
+                  float targetYaw = (float) (MathHelper.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0f;
+                  return Math.abs(MathHelper.wrapDegrees(targetYaw - self.getYaw()));
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/velour/client/module/impl/TriggerBotModule.java
+          package com.velour.client.module.impl;
+
+          import com.velour.client.module.Category;
+          import com.velour.client.module.Module;
+          import com.velour.client.module.setting.BooleanSetting;
+          import com.velour.client.module.setting.NumberSetting;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.entity.Entity;
+          import net.minecraft.entity.LivingEntity;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.util.Hand;
+          import net.minecraft.util.hit.EntityHitResult;
+
+          import java.util.concurrent.ThreadLocalRandom;
+
+          public class TriggerBotModule extends Module {
+              private final NumberSetting minCps = addSetting(new NumberSetting("Min CPS", 9.0, 1.0, 20.0, 0.5));
+              private final NumberSetting maxCps = addSetting(new NumberSetting("Max CPS", 13.0, 1.0, 20.0, 0.5));
+              private final NumberSetting jitterMs = addSetting(new NumberSetting("Jitter ms", 18.0, 0.0, 80.0, 1.0));
+              private final NumberSetting cooldownThreshold = addSetting(new NumberSetting("Cooldown", 0.92, 0.1, 1.0, 0.02));
+              private final BooleanSetting onlyCrits = addSetting(new BooleanSetting("Only Crits", false));
+              private final BooleanSetting requireSprint = addSetting(new BooleanSetting("Require Sprint", false));
+              private final BooleanSetting playersOnly = addSetting(new BooleanSetting("Players Only", true));
+
+              private long nextAttackTimeMs = 0L;
+
+              public TriggerBotModule() {
+                  super("TriggerBot", "Swings on crosshair target with randomized CPS & cooldown sync.", Category.COMBAT);
+              }
+
+              @Override
+              public void onTick(MinecraftClient client) {
+                  if (client.player == null || client.interactionManager == null) return;
+                  if (!(client.crosshairTarget instanceof EntityHitResult hitResult)) return;
+
+                  Entity target = hitResult.getEntity();
+                  if (!(target instanceof LivingEntity living) || !living.isAlive() || target.isSpectator()) return;
+                  if (playersOnly.getValue() && !(target instanceof PlayerEntity)) return;
+
+                  if (requireSprint.getValue() && !client.player.isSprinting()) return;
+
+                  if (onlyCrits.getValue()) {
+                      boolean falling = client.player.fallDistance > 0.0f && !client.player.isOnGround() && !client.player.isClimbing();
+                      if (!falling) return;
+                  }
+
+                  if (client.player.getAttackCooldownProgress(0.5f) < cooldownThreshold.getValue().floatValue()) {
+                      return;
+                  }
+
+                  long now = System.currentTimeMillis();
+                  if (now < nextAttackTimeMs) return;
+
+                  client.interactionManager.attackEntity(client.player, target);
+                  client.player.swingHand(Hand.MAIN_HAND);
+
+                  double low = Math.min(minCps.getValue(), maxCps.getValue());
+                  double high = Math.max(minCps.getValue(), maxCps.getValue());
+                  double cps = low + ThreadLocalRandom.current().nextDouble() * (high - low);
+                  long baseInterval = (long) (1000.0 / Math.max(1.0, cps));
+                  long randomOffset = (long) (ThreadLocalRandom.current().nextGaussian() * jitterMs.getValue() * 0.5);
+                  nextAttackTimeMs = now + Math.max(35L, baseInterval + randomOffset);
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/velour/client/module/impl/AutoShieldBreakerModule.java
+          package com.velour.client.module.impl;
+
+          import com.velour.client.module.Category;
+          import com.velour.client.module.Module;
+          import com.velour.client.module.setting.BooleanSetting;
+          import com.velour.client.module.setting.NumberSetting;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.entity.Entity;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.item.AxeItem;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.util.Hand;
+          import net.minecraft.util.hit.EntityHitResult;
+
+          import java.util.concurrent.ThreadLocalRandom;
+
+          public class AutoShieldBreakerModule extends Module {
+              private final NumberSetting minDelayMs = addSetting(new NumberSetting("Min Delay ms", 45.0, 0.0, 250.0, 5.0));
+              private final NumberSetting maxDelayMs = addSetting(new NumberSetting("Max Delay ms", 110.0, 5.0, 350.0, 5.0));
+              private final BooleanSetting autoSwapAxe = addSetting(new BooleanSetting("Auto Swap Axe", true));
+              private final BooleanSetting swapBack = addSetting(new BooleanSetting("Swap Back", true));
+
+              private long shieldDetectedAtMs = -1L;
+              private long scheduledBreakAtMs = -1L;
+              private int previousSlot = -1;
+              private boolean swapped = false;
+
+              public AutoShieldBreakerModule() {
+                  super("AutoShieldBreaker", "Swaps to an axe with delay to break blocking shields.", Category.COMBAT);
+              }
+
+              @Override
+              public void onTick(MinecraftClient client) {
+                  if (client.player == null || client.interactionManager == null) return;
+
+                  if (swapped && swapBack.getValue() && previousSlot != -1) {
+                      if (client.player.getAttackCooldownProgress(0.5f) >= 0.95f) {
+                          client.player.getInventory().selectedSlot = previousSlot;
+                          previousSlot = -1;
+                          swapped = false;
+                      }
+                  }
+
+                  if (!(client.crosshairTarget instanceof EntityHitResult hitResult)) {
+                      resetSchedule();
+                      return;
+                  }
+
+                  Entity entity = hitResult.getEntity();
+                  if (!(entity instanceof PlayerEntity targetPlayer) || !targetPlayer.isBlocking()) {
+                      resetSchedule();
+                      return;
+                  }
+
+                  long now = System.currentTimeMillis();
+                  if (shieldDetectedAtMs == -1L) {
+                      shieldDetectedAtMs = now;
+                      double low = Math.min(minDelayMs.getValue(), maxDelayMs.getValue());
+                      double high = Math.max(minDelayMs.getValue(), maxDelayMs.getValue());
+                      long delay = (long) (low + ThreadLocalRandom.current().nextDouble() * (high - low));
+                      scheduledBreakAtMs = now + delay;
+                      return;
+                  }
+
+                  if (now < scheduledBreakAtMs) return;
+
+                  if (!isHoldingAxe(client.player)) {
+                      if (!autoSwapAxe.getValue()) return;
+                      int axeSlot = findAxeSlot(client.player);
+                      if (axeSlot == -1) return;
+                      previousSlot = client.player.getInventory().selectedSlot;
+                      client.player.getInventory().selectedSlot = axeSlot;
+                      swapped = true;
+                  }
+
+                  if (client.player.getAttackCooldownProgress(0.5f) >= 0.85f) {
+                      client.interactionManager.attackEntity(client.player, targetPlayer);
+                      client.player.swingHand(Hand.MAIN_HAND);
+                      resetSchedule();
+                  }
+              }
+
+              private boolean isHoldingAxe(PlayerEntity player) {
+                  ItemStack stack = player.getMainHandStack();
+                  return !stack.isEmpty() && stack.getItem() instanceof AxeItem;
+              }
+
+              private int findAxeSlot(PlayerEntity player) {
+                  for (int i = 0; i < 9; i++) {
+                      ItemStack stack = player.getInventory().getStack(i);
+                      if (!stack.isEmpty() && stack.getItem() instanceof AxeItem) {
+                          return i;
+                      }
+                  }
+                  return -1;
+              }
+
+              private void resetSchedule() {
+                  shieldDetectedAtMs = -1L;
+                  scheduledBreakAtMs = -1L;
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/velour/client/module/impl/AutoJumpResetModule.java
+          package com.velour.client.module.impl;
+
+          import com.velour.client.module.Category;
+          import com.velour.client.module.Module;
+          import com.velour.client.module.setting.BooleanSetting;
+          import com.velour.client.module.setting.NumberSetting;
+          import net.minecraft.client.MinecraftClient;
+
+          import java.util.concurrent.ThreadLocalRandom;
+
+          public class AutoJumpResetModule extends Module {
+              private final NumberSetting chance = addSetting(new NumberSetting("Chance %", 75.0, 0.0, 100.0, 5.0));
+              private final NumberSetting tickDelay = addSetting(new NumberSetting("Tick Delay", 1.0, 0.0, 4.0, 1.0));
+              private final BooleanSetting requireForward = addSetting(new BooleanSetting("Require Forward", true));
+              private final BooleanSetting onlyOnGround = addSetting(new BooleanSetting("Only On Ground", true));
+
+              private int lastHurtTime = 0;
+              private int pendingJumpTicks = -1;
+
+              public AutoJumpResetModule() {
+                  super("AutoJumpReset", "Timed probabilistic jump reset on incoming hit knockback.", Category.MOVEMENT);
+              }
+
+              @Override
+              public void onTick(MinecraftClient client) {
+                  if (client.player == null) return;
+
+                  int hurtTime = client.player.hurtTime;
+                  if (hurtTime > lastHurtTime && hurtTime > 0) {
+                      boolean forwardOk = !requireForward.getValue() || client.options.forwardKey.isPressed();
+                      boolean groundOk = !onlyOnGround.getValue() || client.player.isOnGround();
+                      boolean rollPass = ThreadLocalRandom.current().nextDouble() * 100.0 <= chance.getValue();
+
+                      if (forwardOk && groundOk && rollPass) {
+                          pendingJumpTicks = tickDelay.getValue().intValue();
+                      }
+                  }
+                  lastHurtTime = hurtTime;
+
+                  if (pendingJumpTicks > 0) {
+                      pendingJumpTicks--;
+                      return;
+                  }
+
+                  if (pendingJumpTicks == 0) {
+                      pendingJumpTicks = -1;
+                      if (client.player.isOnGround() && !client.player.isTouchingWater() && !client.player.isInLava()) {
+                          client.player.jump();
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/java/com/velour/client/gui/ClickGuiScreen.java
+          package com.velour.client.gui;
+
+          import com.velour.client.module.Category;
+          import com.velour.client.module.Module;
+          import com.velour.client.module.ModuleManager;
+          import com.velour.client.module.setting.BooleanSetting;
+          import com.velour.client.module.setting.NumberSetting;
+          import com.velour.client.module.setting.Setting;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.math.MathHelper;
+          import org.lwjgl.glfw.GLFW;
+
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Map;
+
+          public class ClickGuiScreen extends Screen {
+              private static final int PANEL_WIDTH = 132;
+              private static final int HEADER_HEIGHT = 20;
+              private static final int MODULE_HEIGHT = 16;
+              private static final int SETTING_HEIGHT = 14;
+
+              private static final int BG_BACKDROP = 0x99090B10;
+              private static final int PANEL_BG = 0xE612161F;
+              private static final int HEADER_BG = 0xFF191F2C;
+              private static final int ACCENT = 0xFF5B8CFF;
+              private static final int MODULE_ON_BG = 0xFF1E2A44;
+              private static final int TEXT_MAIN = 0xFFF3F6FA;
+              private static final int TEXT_MUTED = 0xFF9AA5B8;
+
+              private final ModuleManager moduleManager;
+              private final Map<Module, Boolean> expandedModules = new HashMap<>();
+              private final Map<Category, int[]> panelPositions = new HashMap<>();
+
+              private Category draggingPanel = null;
+              private int dragOffsetX = 0;
+              private int dragOffsetY = 0;
+
+              private NumberSetting activeSlider = null;
+              private int sliderX = 0;
+              private int sliderW = 0;
+
+              public ClickGuiScreen(ModuleManager moduleManager) {
+                  super(Text.literal("Velour ClickGUI"));
+                  this.moduleManager = moduleManager;
+
+                  int startX = 24;
+                  int startY = 28;
+                  for (Category cat : Category.values()) {
+                      panelPositions.put(cat, new int[]{startX, startY});
+                      startX += PANEL_WIDTH + 18;
+                  }
+              }
+
+              @Override
+              public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+                  context.fill(0, 0, this.width, this.height, BG_BACKDROP);
+
+                  if (activeSlider != null) {
+                      updateSliderValue(mouseX);
+                  }
+
+                  for (Category category : Category.values()) {
+                      int[] pos = panelPositions.get(category);
+                      int px = pos[0];
+                      int py = pos[1];
+
+                      List<Module> modules = moduleManager.getByCategory(category);
+                      int totalHeight = HEADER_HEIGHT + computeListHeight(modules) + 4;
+
+                      context.fill(px + 2, py + 2, px + PANEL_WIDTH + 2, py + totalHeight + 2, 0x55000000);
+                      context.fill(px, py, px + PANEL_WIDTH, py + totalHeight, PANEL_BG);
+                      context.fill(px, py, px + PANEL_WIDTH, py + HEADER_HEIGHT, HEADER_BG);
+                      context.fill(px, py + HEADER_HEIGHT - 1, px + PANEL_WIDTH, py + HEADER_HEIGHT, ACCENT);
+
+                      context.drawTextWithShadow(this.textRenderer, category.getDisplayName(), px + 8, py + 6, TEXT_MAIN);
+
+                      int cursorY = py + HEADER_HEIGHT + 2;
+                      for (Module module : modules) {
+                          boolean hovered = isInside(mouseX, mouseY, px + 2, cursorY, PANEL_WIDTH - 4, MODULE_HEIGHT);
+                          int rowBg = module.isEnabled() ? MODULE_ON_BG : (hovered ? 0x33FFFFFF : 0x00000000);
+
+                          context.fill(px + 2, cursorY, px + PANEL_WIDTH - 2, cursorY + MODULE_HEIGHT, rowBg);
+                          if (module.isEnabled()) {
+                              context.fill(px + 2, cursorY, px + 4, cursorY + MODULE_HEIGHT, ACCENT);
+                          }
+
+                          int nameColor = module.isEnabled() ? TEXT_MAIN : (hovered ? TEXT_MAIN : TEXT_MUTED);
+                          context.drawTextWithShadow(this.textRenderer, module.getName(), px + 8, cursorY + 4, nameColor);
+
+                          boolean isOpen = expandedModules.getOrDefault(module, false);
+                          String arrow = isOpen ? "-" : "+";
+                          context.drawTextWithShadow(this.textRenderer, arrow, px + PANEL_WIDTH - 12, cursorY + 4, TEXT_MUTED);
+
+                          cursorY += MODULE_HEIGHT;
+
+                          if (isOpen) {
+                              for (Setting<?> setting : module.getSettings()) {
+                                  if (setting instanceof BooleanSetting boolSetting) {
+                                      boolean bHover = isInside(mouseX, mouseY, px + 6, cursorY, PANEL_WIDTH - 12, SETTING_HEIGHT);
+                                      context.fill(px + 6, cursorY + 1, px + PANEL_WIDTH - 6, cursorY + SETTING_HEIGHT - 1, bHover ? 0x22FFFFFF : 0x11000000);
+                                      int color = boolSetting.getValue() ? ACCENT : TEXT_MUTED;
+                                      context.drawTextWithShadow(
+                                              this.textRenderer,
+                                              boolSetting.getName() + ": " + (boolSetting.getValue() ? "ON" : "OFF"),
+                                              px + 10,
+                                              cursorY + 3,
+                                              color
+                                      );
+                                  } else if (setting instanceof NumberSetting numSetting) {
+                                      int sx = px + 8;
+                                      int sw = PANEL_WIDTH - 16;
+                                      double span = Math.max(0.0001, numSetting.getMax() - numSetting.getMin());
+                                      double pct = MathHelper.clamp((numSetting.getValue() - numSetting.getMin()) / span, 0.0, 1.0);
+                                      int fillW = (int) (sw * pct);
+
+                                      context.fill(sx, cursorY + 2, sx + sw, cursorY + SETTING_HEIGHT - 1, 0xFF0C0F16);
+                                      context.fill(sx, cursorY + 2, sx + fillW, cursorY + SETTING_HEIGHT - 1, ACCENT);
+
+                                      String label = numSetting.getName() + " " + formatNum(numSetting.getValue());
+                                      context.drawTextWithShadow(this.textRenderer, label, sx + 3, cursorY + 3, TEXT_MAIN);
+                                  }
+                                  cursorY += SETTING_HEIGHT;
+                              }
+                          }
+                      }
+                  }
+
+                  super.render(context, mouseX, mouseY, delta);
+              }
+
+              @Override
+              public boolean mouseClicked(double mouseX, double mouseY, int button) {
+                  for (Category category : Category.values()) {
+                      int[] pos = panelPositions.get(category);
+                      int px = pos[0];
+                      int py = pos[1];
+
+                      if (button == 0 && isInside(mouseX, mouseY, px, py, PANEL_WIDTH, HEADER_HEIGHT)) {
+                          draggingPanel = category;
+                          dragOffsetX = (int) mouseX - px;
+                          dragOffsetY = (int) mouseY - py;
+                          return true;
+                      }
+
+                      int cursorY = py + HEADER_HEIGHT + 2;
+                      for (Module module : moduleManager.getByCategory(category)) {
+                          if (isInside(mouseX, mouseY, px + 2, cursorY, PANEL_WIDTH - 4, MODULE_HEIGHT)) {
+                              if (button == 0) {
+                                  module.toggle();
+                                  return true;
+                              } else if (button == 1) {
+                                  expandedModules.put(module, !expandedModules.getOrDefault(module, false));
+                                  return true;
+                              }
+                          }
+                          cursorY += MODULE_HEIGHT;
+
+                          if (expandedModules.getOrDefault(module, false)) {
+                              for (Setting<?> setting : module.getSettings()) {
+                                  if (setting instanceof BooleanSetting boolSetting && button == 0) {
+                                      if (isInside(mouseX, mouseY, px + 6, cursorY, PANEL_WIDTH - 12, SETTING_HEIGHT)) {
+                                          boolSetting.toggle();
+                                          return true;
+                                      }
+                                  } else if (setting instanceof NumberSetting numSetting && button == 0) {
+                                      int sx = px + 8;
+                                      int sw = PANEL_WIDTH - 16;
+                                      if (isInside(mouseX, mouseY, sx, cursorY + 1, sw, SETTING_HEIGHT - 1)) {
+                                          activeSlider = numSetting;
+                                          sliderX = sx;
+                                          sliderW = sw;
+                                          updateSliderValue(mouseX);
+                                          return true;
+                                      }
+                                  }
+                                  cursorY += SETTING_HEIGHT;
+                              }
+                          }
+                      }
+                  }
+
+                  return super.mouseClicked(mouseX, mouseY, button);
+              }
+
+              @Override
+              public boolean mouseReleased(double mouseX, double mouseY, int button) {
+                  draggingPanel = null;
+                  activeSlider = null;
+                  return super.mouseReleased(mouseX, mouseY, button);
+              }
+
+              @Override
+              public boolean mouseDragged(double mouseX, double mouseY, int button, double deltaX, double deltaY) {
+                  if (draggingPanel != null) {
+                      int[] pos = panelPositions.get(draggingPanel);
+                      pos[0] = (int) mouseX - dragOffsetX;
+                      pos[1] = (int) mouseY - dragOffsetY;
+                      return true;
+                  }
+                  if (activeSlider != null) {
+                      updateSliderValue(mouseX);
+                      return true;
+                  }
+                  return super.mouseDragged(mouseX, mouseY, button, deltaX, deltaY);
+              }
+
+              @Override
+              public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+                  if (keyCode == GLFW.GLFW_KEY_RIGHT_SHIFT || keyCode == GLFW.GLFW_KEY_ESCAPE) {
+                      this.close();
+                      return true;
+                  }
+                  return super.keyPressed(keyCode, scanCode, modifiers);
+              }
+
+              @Override
+              public boolean shouldPause() {
+                  return false;
+              }
+
+              private void updateSliderValue(double mouseX) {
+                  if (activeSlider == null || sliderW <= 0) return;
+                  double ratio = MathHelper.clamp((mouseX - sliderX) / (double) sliderW, 0.0, 1.0);
+                  double raw = activeSlider.getMin() + ratio * (activeSlider.getMax() - activeSlider.getMin());
+                  activeSlider.setValue(raw);
+              }
+
+              private int computeListHeight(List<Module> modules) {
+                  int h = 0;
+                  for (Module m : modules) {
+                      h += MODULE_HEIGHT;
+                      if (expandedModules.getOrDefault(m, false)) {
+                          h += m.getSettings().size() * SETTING_HEIGHT;
+                      }
+                  }
+                  return h;
+              }
+
+              private boolean isInside(double mx, double my, int x, int y, int w, int h) {
+                  return mx >= x && mx <= x + w && my >= y && my <= y + h;
+              }
+
+              private String formatNum(double val) {
+                  if (Math.abs(val - Math.round(val)) < 0.0001) {
+                      return Long.toString(Math.round(val));
+                  }
+                  return String.format("%.2f", val);
+              }
+          }
+          EOF
+
+      - name: Build Fabric Mod Jar
+        run: gradle build --no-daemon
+
+      - name: Upload Compiled Jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: velour-1.21.11-mod
+          path: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
+            !build/libs/*-dev.jar
+          if-no-files-found: error
